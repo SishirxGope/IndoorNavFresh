@@ -1,11 +1,6 @@
 /**
  * LocationScreen.tsx
- * Complete indoor positioning screen combining all features:
- *   • Prompt 2 — runtime location permission check
- *   • Prompt 3 — pinch-zoomable / pannable floor map with animated dot
- *   • Prompt 4 — __DEV__ test mode with real radiomap scan data
- *
- * Place floorplan.png in IndoorNav/assets/floorplan.png before running.
+ * Amber terminal / radar-HUD indoor positioning screen.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -31,32 +26,43 @@ import Animated, {
   withTiming,
 } from 'react-native-reanimated';
 import Toast from 'react-native-toast-message';
-import axios from 'axios';
 import WifiManager from 'react-native-wifi-reborn';
 
-import { API_URL } from '@env';
 import {
   checkLocationPermission,
   requestLocationPermission,
 } from '../utils/PermissionsHelper';
+import { locate, type PreviousPosition } from '../services/LocalLocator';
+import { ShaderBackground } from '../components/ShaderBackground';
+
+// ── Amber terminal palette ────────────────────────────────────────────────────
+const C_AMBER     = '#f59e0b';
+const C_AMBER_DIM = 'rgba(245,158,11,0.45)';
+const C_AMBER_FNT = 'rgba(245,158,11,0.12)';
+const C_AMBER_BRD = 'rgba(245,158,11,0.22)';
+const C_WHITE     = '#fef9ed';
+const C_DIM_TEXT  = 'rgba(254,249,237,0.45)';
+const C_CARD_BG   = 'rgba(5,4,0,0.88)';
+const C_MAP_BG    = 'rgba(10,8,2,0.92)';
+const C_WARN      = '#fbbf24';
 
 // ── constants ─────────────────────────────────────────────────────────────────
-const API_BASE    = API_URL ?? 'http://10.0.2.2:8000';
 const POLL_MS     = 3_000;
 const DOT_RADIUS  = 12;
-
-// Actual grid dimensions from the radiomap dataset (rows 0–26, cols 0–7)
 const GRID_ROWS   = 27;
-const GRID_COLS   = 8;
+const GRID_COLS   = 4;   // Floor 9: cols 0, 1, 2, 3
+const MAP_PADDING = 20;
+
 
 // ── types ─────────────────────────────────────────────────────────────────────
 interface ScanItem { bssid: string; rssi: number; }
 
 interface LocateResponse {
+  floor:          number;
   row:            number;
   col:            number;
   confidence:     number;
-  nearby:         Array<{ row: number; col: number }>;
+  nearby:         Array<{ floor: number; row: number; col: number }>;
   matched_bssids: number;
   low_confidence: boolean;
 }
@@ -64,8 +70,6 @@ interface LocateResponse {
 interface MapSize { w: number; h: number; }
 
 // ── test mode data ────────────────────────────────────────────────────────────
-// Real mean RSSI fingerprints extracted from the radiomap for 5 grid positions.
-// Used when test mode is active (__DEV__ only).
 const TEST_SCANS: Array<{ label: string; row: number; col: number; scans: ScanItem[] }> = [
   {
     label: 'Zone (2, 1)  — top-left area',
@@ -143,37 +147,50 @@ const TEST_SCANS: Array<{ label: string; row: number; col: number; scans: ScanIt
 ];
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-/**
- * Map grid (row, col) → pixel position inside the floor-map image container.
- *
- * The floor plan has rows on the Y axis (0 at top, GRID_ROWS-1 at bottom)
- * and cols on the X axis (0 at left, GRID_COLS-1 at right).
- */
-function gridToPixel(row: number, col: number, mapSize: MapSize) {
+// Square cell size — use the smaller dimension so cells are never stretched
+function gridLayout(mapSize: MapSize) {
+  const usableW = mapSize.w - 2 * MAP_PADDING;
+  const usableH = mapSize.h - 2 * MAP_PADDING;
+  const cell = Math.min(usableW / GRID_COLS, usableH / GRID_ROWS);
+  const gridW = cell * GRID_COLS;
+  const gridH = cell * GRID_ROWS;
   return {
-    x: (col / (GRID_COLS - 1)) * mapSize.w,
-    y: (row / (GRID_ROWS - 1)) * mapSize.h,
+    cell,
+    offsetX: (mapSize.w - gridW) / 2,
+    offsetY: (mapSize.h - gridH) / 2,
+  };
+}
+
+// Data points sit at cell centres
+function gridToPixel(row: number, col: number, mapSize: MapSize) {
+  const { cell, offsetX, offsetY } = gridLayout(mapSize);
+  return {
+    x: offsetX + (col + 0.5) * cell,
+    y: offsetY + (row + 0.5) * cell,
+  };
+}
+
+// Cell-boundary intersection (corners of each cell)
+function boundaryToPixel(bRow: number, bCol: number, mapSize: MapSize) {
+  const { cell, offsetX, offsetY } = gridLayout(mapSize);
+  return {
+    x: offsetX + bCol * cell,
+    y: offsetY + bRow * cell,
   };
 }
 
 // ── component ─────────────────────────────────────────────────────────────────
 export default function LocationScreen(): React.JSX.Element {
-  // ── state ──────────────────────────────────────────────────────────────────
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
   const [location,      setLocation]      = useState<LocateResponse | null>(null);
   const [loading,       setLoading]       = useState(false);
   const [mapSize,       setMapSize]       = useState<MapSize>({ w: 0, h: 0 });
 
-  // Test mode — only relevant in __DEV__ builds
   const [testMode,      setTestMode]      = useState(false);
   const testIndexRef = useRef(0);
-
-  // Bayesian smoothing: remember last fix
-  const previousRef = useRef<{ row: number; col: number } | undefined>(undefined);
+  const previousRef  = useRef<PreviousPosition | undefined>(undefined);
 
   // ── Reanimated shared values ───────────────────────────────────────────────
-
-  // Map pan/pinch transform
   const scale      = useSharedValue(1);
   const translateX = useSharedValue(0);
   const translateY = useSharedValue(0);
@@ -181,12 +198,12 @@ export default function LocationScreen(): React.JSX.Element {
   const savedTx    = useSharedValue(0);
   const savedTy    = useSharedValue(0);
 
-  // Dot position (in map-container local pixels)
   const dotLeft    = useSharedValue(-DOT_RADIUS);
   const dotTop     = useSharedValue(-DOT_RADIUS);
-
-  // Dot pulse ring scale
   const pulseScale = useSharedValue(1);
+
+  // Blinking scan indicator
+  const scanOpacity = useSharedValue(1);
 
   // ── pulse animation ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -199,7 +216,18 @@ export default function LocationScreen(): React.JSX.Element {
     );
   }, [pulseScale]);
 
-  // ── update dot when location or map size changes ───────────────────────────
+  // ── scan blink animation ───────────────────────────────────────────────────
+  useEffect(() => {
+    scanOpacity.value = withRepeat(
+      withSequence(
+        withTiming(0.15, { duration: 400 }),
+        withTiming(1.0,  { duration: 400 }),
+      ),
+      -1,
+    );
+  }, [scanOpacity]);
+
+  // ── update dot position ────────────────────────────────────────────────────
   useEffect(() => {
     if (!location || mapSize.w === 0) return;
     const { x, y } = gridToPixel(location.row, location.col, mapSize);
@@ -209,12 +237,8 @@ export default function LocationScreen(): React.JSX.Element {
 
   // ── gesture handlers ────────────────────────────────────────────────────────
   const pinchGesture = Gesture.Pinch()
-    .onUpdate((e) => {
-      scale.value = Math.max(1, Math.min(5, savedScale.value * e.scale));
-    })
-    .onEnd(() => {
-      savedScale.value = scale.value;
-    });
+    .onUpdate((e) => { scale.value = Math.max(1, Math.min(5, savedScale.value * e.scale)); })
+    .onEnd(()    => { savedScale.value = scale.value; });
 
   const panGesture = Gesture.Pan()
     .minPointers(1)
@@ -227,7 +251,6 @@ export default function LocationScreen(): React.JSX.Element {
       savedTy.value = translateY.value;
     });
 
-  // Double-tap to reset zoom
   const doubleTap = Gesture.Tap()
     .numberOfTaps(2)
     .onEnd(() => {
@@ -239,8 +262,7 @@ export default function LocationScreen(): React.JSX.Element {
       savedTy.value    = 0;
     });
 
-  const composed = Gesture.Simultaneous(pinchGesture, panGesture);
-  const gestures = Gesture.Race(doubleTap, composed);
+  const gestures = Gesture.Race(doubleTap, Gesture.Simultaneous(pinchGesture, panGesture));
 
   // ── animated styles ─────────────────────────────────────────────────────────
   const mapAnimStyle = useAnimatedStyle(() => ({
@@ -261,17 +283,16 @@ export default function LocationScreen(): React.JSX.Element {
     opacity:   withTiming(pulseScale.value > 1.3 ? 0 : 0.5),
   }));
 
-  // ── permission check on mount & app-resume ─────────────────────────────────
+  const scanBlinkStyle = useAnimatedStyle(() => ({ opacity: scanOpacity.value }));
+
+  // ── permission ─────────────────────────────────────────────────────────────
   useEffect(() => {
     requestLocationPermission().then(setHasPermission);
   }, []);
 
   useEffect(() => {
     const sub = AppState.addEventListener('change', async (next: AppStateStatus) => {
-      if (next === 'active') {
-        const ok = await checkLocationPermission();
-        setHasPermission(ok);
-      }
+      if (next === 'active') setHasPermission(await checkLocationPermission());
     });
     return () => sub.remove();
   }, []);
@@ -283,26 +304,21 @@ export default function LocationScreen(): React.JSX.Element {
       let scans: ScanItem[];
 
       if (__DEV__ && testMode) {
-        // Test mode: cycle through hardcoded scans
         const entry = TEST_SCANS[testIndexRef.current % TEST_SCANS.length];
         scans = entry.scans;
         testIndexRef.current += 1;
       } else {
-        // Real WiFi scan
         if (Platform.OS === 'android') {
           const nets = await WifiManager.loadWifiList();
-          scans = (nets as any[]).map((n) => ({
-            bssid: (n.BSSID as string)?.toLowerCase() ?? '',
-            rssi:  n.level as number ?? -100,
-          }));
+          scans = (nets as any[])
+            .map((n) => ({
+              bssid: (n.BSSID as string)?.toLowerCase() ?? '',
+              rssi:  typeof n.level === 'number' && isFinite(n.level) ? n.level : -100,
+            }))
+            .filter((s) => s.bssid !== '');
         } else {
-          // iOS: WifiManager.getCurrentWifiSSID() gives only the connected AP.
-          // For full scan support on iOS, a custom native module is required.
-          Toast.show({
-            type:  'info',
-            text1: 'iOS scanning limited',
-            text2: 'Use Test Mode or a real Android device for full WiFi scanning.',
-          });
+          Toast.show({ type: 'info', text1: 'iOS scanning limited',
+            text2: 'Use Test Mode or Android for full WiFi scanning.' });
           return;
         }
       }
@@ -312,29 +328,19 @@ export default function LocationScreen(): React.JSX.Element {
         return;
       }
 
-      const body: Record<string, unknown> = { scans };
-      if (previousRef.current) body.previous = previousRef.current;
-
-      const { data } = await axios.post<LocateResponse>(`${API_BASE}/locate`, body, {
-        timeout: 5_000,
-      });
-
+      const data = locate(scans, previousRef.current);
       setLocation(data);
-      previousRef.current = { row: data.row, col: data.col };
+      previousRef.current = { floor: data.floor, row: data.row, col: data.col };
 
       if (data.low_confidence) {
         Toast.show({
-          type:  'info',
-          text1: 'Low confidence',
+          type: 'info', text1: 'Low confidence',
           text2: `Only ${data.matched_bssids} known APs matched`,
           visibilityTime: 2000,
         });
       }
     } catch (err: unknown) {
-      const msg =
-        axios.isAxiosError(err)
-          ? (err.response?.data?.detail ?? err.message)
-          : String(err);
+      const msg = err instanceof Error ? err.message : String(err);
       Toast.show({ type: 'error', text1: 'Location error', text2: msg });
     } finally {
       setLoading(false);
@@ -350,36 +356,36 @@ export default function LocationScreen(): React.JSX.Element {
   }, [hasPermission, testMode, scanAndLocate]);
 
   // ── derived display values ──────────────────────────────────────────────────
-  const pct   = location ? Math.round(location.confidence * 100) : 0;
-  const color  =
-    pct >= 70 ? '#22c55e' :
-    pct >= 40 ? '#f59e0b' : '#ef4444';
+  const pct = location ? Math.round(location.confidence * 100) : 0;
+
 
   // ── render — permission denied ──────────────────────────────────────────────
   if (hasPermission === false) {
     return (
       <View style={styles.centred}>
-        <Text style={styles.permTitle}>Location Permission Required</Text>
+        <ShaderBackground />
+        <Text style={styles.permTitle}>&gt;&gt; PERMISSION REQUIRED</Text>
         <Text style={styles.permBody}>
-          WiFi scanning on Android needs Location permission. Please allow it in
-          your device Settings → Apps → IndoorNav → Permissions.
+          WiFi scanning on Android requires Location permission.{'\n'}
+          Settings → Apps → IndoorNav → Permissions
         </Text>
         <TouchableOpacity
           style={styles.retryBtn}
           onPress={() => requestLocationPermission().then(setHasPermission)}
         >
-          <Text style={styles.retryBtnText}>Retry</Text>
+          <Text style={styles.retryBtnText}>RETRY</Text>
         </TouchableOpacity>
       </View>
     );
   }
 
-  // ── render — waiting for permission response ────────────────────────────────
+  // ── render — awaiting permission ────────────────────────────────────────────
   if (hasPermission === null) {
     return (
       <View style={styles.centred}>
-        <ActivityIndicator size="large" color="#3b82f6" />
-        <Text style={styles.permBody}>Requesting permission…</Text>
+        <ShaderBackground />
+        <ActivityIndicator size="large" color={C_AMBER} />
+        <Text style={[styles.permBody, { marginTop: 16 }]}>Requesting permission…</Text>
       </View>
     );
   }
@@ -388,18 +394,38 @@ export default function LocationScreen(): React.JSX.Element {
   return (
     <View style={styles.container}>
 
-      {/* ── Test Mode banner (DEV only) ── */}
+      {/* ── Shader background ── */}
+      <ShaderBackground />
+
+      {/* ── Test mode banner ── */}
       {__DEV__ && testMode && (
         <View style={styles.testBanner}>
           <Text style={styles.testBannerText}>
-            TEST MODE — simulated scans (cycle {(testIndexRef.current % TEST_SCANS.length) + 1}/
-            {TEST_SCANS.length})
+            {`>> TEST MODE  ·  SCAN ${(testIndexRef.current % TEST_SCANS.length) + 1} / ${TEST_SCANS.length}`}
           </Text>
         </View>
       )}
 
       {/* ── Zoomable floor map ── */}
       <View style={styles.mapWrapper}>
+        {/* Corner brackets — targeting reticle */}
+        <View style={[styles.corner, styles.cornerTL]} pointerEvents="none">
+          <View style={styles.cornerH} />
+          <View style={styles.cornerV} />
+        </View>
+        <View style={[styles.corner, styles.cornerTR]} pointerEvents="none">
+          <View style={styles.cornerH} />
+          <View style={[styles.cornerV, { right: 0 }]} />
+        </View>
+        <View style={[styles.corner, styles.cornerBL]} pointerEvents="none">
+          <View style={styles.cornerH} />
+          <View style={styles.cornerV} />
+        </View>
+        <View style={[styles.corner, styles.cornerBR]} pointerEvents="none">
+          <View style={styles.cornerH} />
+          <View style={[styles.cornerV, { right: 0 }]} />
+        </View>
+
         <GestureDetector gesture={gestures}>
           <Animated.View
             style={[styles.mapContainer, mapAnimStyle]}
@@ -410,20 +436,57 @@ export default function LocationScreen(): React.JSX.Element {
               })
             }
           >
-            {/* Floor plan image */}
-            <Animated.Image
-              // eslint-disable-next-line @typescript-eslint/no-require-imports
-              source={require('../../assets/floorplan.png')}
-              style={styles.mapImage}
-              resizeMode="contain"
-            />
+            {/* ── Tactical grid ── */}
+            {mapSize.w > 0 && (
+              <>
+                {/* Vertical boundary lines */}
+                {Array.from({ length: GRID_COLS + 1 }).map((_, c) => {
+                  const top = boundaryToPixel(0, c, mapSize);
+                  const bot = boundaryToPixel(GRID_ROWS, c, mapSize);
+                  return (
+                    <View
+                      key={`v${c}`}
+                      style={[styles.gridLineV, {
+                        left: top.x,
+                        top: top.y,
+                        height: bot.y - top.y,
+                      }]}
+                    />
+                  );
+                })}
+                {/* Horizontal boundary lines */}
+                {Array.from({ length: GRID_ROWS + 1 }).map((_, r) => {
+                  const left = boundaryToPixel(r, 0, mapSize);
+                  const right = boundaryToPixel(r, GRID_COLS, mapSize);
+                  return (
+                    <View
+                      key={`h${r}`}
+                      style={[styles.gridLineH, {
+                        top: left.y,
+                        left: left.x,
+                        width: right.x - left.x,
+                      }]}
+                    />
+                  );
+                })}
+                {/* Corner crosshairs */}
+                {Array.from({ length: GRID_ROWS + 1 }).flatMap((_, r) =>
+                  Array.from({ length: GRID_COLS + 1 }).map((_, c) => {
+                    const { x, y } = boundaryToPixel(r, c, mapSize);
+                    return (
+                      <React.Fragment key={`g${r}-${c}`}>
+                        <View style={[styles.crossH, { left: x - 6, top: y - 0.5 }]} />
+                        <View style={[styles.crossV, { left: x - 0.5, top: y - 6 }]} />
+                      </React.Fragment>
+                    );
+                  })
+                )}
+              </>
+            )}
 
-            {/* Location dot — absolutely positioned inside the map container */}
             {location && (
               <Animated.View style={[styles.dotWrapper, dotContainerStyle]}>
-                {/* Pulse ring */}
                 <Animated.View style={[styles.dotPulse, pulseStyle]} />
-                {/* Core dot */}
                 <View style={styles.dotCore} />
               </Animated.View>
             )}
@@ -431,54 +494,59 @@ export default function LocationScreen(): React.JSX.Element {
         </GestureDetector>
 
         {/* Zoom hint */}
-        <Text style={styles.zoomHint}>Pinch to zoom · Double-tap to reset</Text>
+        <Text style={styles.zoomHint}>&gt;&gt; PINCH · DBL-TAP RESET</Text>
 
-        {/* Loading spinner */}
+        {/* Scan indicator */}
         {loading && (
-          <View style={styles.loadingBadge}>
-            <ActivityIndicator size="small" color="#3b82f6" />
-          </View>
+          <Animated.View style={[styles.scanBadge, scanBlinkStyle]}>
+            <Text style={styles.scanBadgeText}>&gt;&gt; SCAN</Text>
+          </Animated.View>
         )}
       </View>
 
-      {/* ── Info card ── */}
+      {/* ── Info card — terminal readout ── */}
       <View style={styles.card}>
         {location ? (
           <>
-            <Text style={styles.cardTitle}>
-              You are at Zone ({Math.round(location.row)}, {Math.round(location.col)})
-            </Text>
+            <Text style={styles.cardHeader}>&gt;&gt; POSITION LOCK</Text>
+            <View style={styles.cardDivider} />
 
-            <View style={styles.cardRow}>
-              <Text style={styles.label}>Confidence</Text>
-              <Text style={[styles.value, { color }]}>{pct}%</Text>
+            <View style={styles.termRow}>
+              <Text style={styles.termLabel}>FLOOR</Text>
+              <Text style={styles.termValue}>F {location.floor}</Text>
             </View>
 
-            <View style={styles.cardRow}>
-              <Text style={styles.label}>Matched APs</Text>
-              <Text style={styles.value}>{location.matched_bssids}</Text>
+            <View style={styles.termRow}>
+              <Text style={styles.termLabel}>ZONE</Text>
+              <Text style={styles.termValue}>
+                R{String(Math.round(location.row)).padStart(2, '0')} / C{location.col}
+              </Text>
             </View>
 
-            {location.nearby.length > 0 && (
-              <View style={styles.cardRow}>
-                <Text style={styles.label}>Nearby zones</Text>
-                <Text style={styles.value}>
-                  {location.nearby
-                    .map((p) => `(${Math.round(p.row)},${Math.round(p.col)})`)
-                    .join('  ')}
-                </Text>
+            <View style={styles.termRow}>
+              <Text style={styles.termLabel}>SIGNAL</Text>
+              <Text style={styles.termValue}>{location.matched_bssids} AP</Text>
+            </View>
+
+            <View style={styles.termRow}>
+              <Text style={styles.termLabel}>CONF</Text>
+              <View style={styles.confBar}>
+                {Array.from({ length: 10 }).map((_, i) => (
+                  <View
+                    key={i}
+                    style={[styles.confSeg, i < Math.round(pct / 10) && styles.confSegFill]}
+                  />
+                ))}
+                <Text style={styles.confPct}>{pct}%</Text>
               </View>
-            )}
+            </View>
 
             {location.low_confidence && (
-              <Text style={styles.lowConfBadge}>⚠ Low confidence — move closer to known APs</Text>
+              <Text style={styles.warnText}>&gt; LOW SIGNAL — REPOSITION</Text>
             )}
           </>
         ) : (
-          <View style={styles.cardRow}>
-            <ActivityIndicator size="small" color="#3b82f6" />
-            <Text style={[styles.label, { marginLeft: 8 }]}>Scanning…</Text>
-          </View>
+          <Text style={styles.cardHeader}>&gt;&gt; SCANNING...</Text>
         )}
       </View>
 
@@ -494,7 +562,7 @@ export default function LocationScreen(): React.JSX.Element {
           }}
         >
           <Text style={styles.testToggleText}>
-            {testMode ? '🔴 TEST MODE ON' : '🧪 Test Mode'}
+            {testMode ? '◉ ACTIVE' : '>> TEST'}
           </Text>
         </TouchableOpacity>
       )}
@@ -508,76 +576,138 @@ export default function LocationScreen(): React.JSX.Element {
 const styles = StyleSheet.create({
   container: {
     flex:            1,
-    backgroundColor: '#f1f5f9',
+    backgroundColor: 'transparent',
   },
 
-  // Permission denied
+  // Permission / loading screens
   centred: {
-    flex:           1,
-    alignItems:     'center',
-    justifyContent: 'center',
-    padding:        32,
-    backgroundColor: '#f1f5f9',
+    flex:            1,
+    alignItems:      'center',
+    justifyContent:  'center',
+    padding:         32,
+    backgroundColor: 'transparent',
   },
   permTitle: {
-    fontSize:     18,
-    fontWeight:   '700',
-    color:        '#1e293b',
-    textAlign:    'center',
-    marginBottom: 12,
+    fontFamily:    'monospace',
+    fontSize:      15,
+    fontWeight:    '700',
+    color:         C_AMBER,
+    textAlign:     'center',
+    marginBottom:  14,
+    letterSpacing: 2,
+    textTransform: 'uppercase',
   },
   permBody: {
-    fontSize:   14,
-    color:      '#64748b',
-    textAlign:  'center',
-    lineHeight: 22,
+    fontFamily:    'monospace',
+    fontSize:      13,
+    color:         C_DIM_TEXT,
+    textAlign:     'center',
+    lineHeight:    22,
+    letterSpacing: 0.5,
   },
   retryBtn: {
-    marginTop:       24,
-    paddingVertical: 10,
-    paddingHorizontal: 28,
-    backgroundColor: '#3b82f6',
-    borderRadius:    8,
+    marginTop:         24,
+    paddingVertical:   12,
+    paddingHorizontal: 32,
+    backgroundColor:   'rgba(245,158,11,0.15)',
+    borderRadius:      2,
+    borderWidth:       1,
+    borderColor:       C_AMBER_BRD,
   },
   retryBtnText: {
-    color:      '#fff',
-    fontWeight: '600',
-    fontSize:   15,
+    fontFamily:    'monospace',
+    color:         C_AMBER,
+    fontWeight:    '700',
+    fontSize:      13,
+    letterSpacing: 3,
   },
 
   // Test mode banner
   testBanner: {
-    backgroundColor: '#fef08a',
-    paddingVertical: 6,
-    alignItems:      'center',
+    backgroundColor:   C_AMBER_FNT,
+    borderBottomWidth: 1,
+    borderBottomColor: C_AMBER_BRD,
+    paddingVertical:   7,
+    alignItems:        'center',
   },
   testBannerText: {
-    fontSize:   12,
-    fontWeight: '700',
-    color:      '#713f12',
+    fontFamily:    'monospace',
+    fontSize:      11,
+    fontWeight:    '700',
+    color:         C_AMBER,
+    letterSpacing: 1.5,
   },
 
   // Map
   mapWrapper: {
-    flex:         1,
-    margin:       12,
-    borderRadius: 12,
-    overflow:     'hidden',
-    backgroundColor: '#ffffff',
-    elevation:    3,
-    shadowColor:  '#000',
-    shadowOpacity: 0.08,
-    shadowRadius:  6,
+    flex:            1,
+    margin:          12,
+    marginBottom:    6,
+    borderRadius:    4,
+    overflow:        'hidden',
+    backgroundColor: C_MAP_BG,
+    borderWidth:     1,
+    borderColor:     C_AMBER_BRD,
+    elevation:       8,
+    shadowColor:     C_AMBER,
+    shadowOpacity:   0.15,
+    shadowRadius:    12,
   },
   mapContainer: {
     flex: 1,
   },
-  mapImage: {
-    width:  '100%',
-    height: '100%',
+  gridLineH: {
+    position:        'absolute',
+    height:          StyleSheet.hairlineWidth,
+    backgroundColor: 'rgba(245,158,11,0.12)',
+  },
+  gridLineV: {
+    position:        'absolute',
+    width:           StyleSheet.hairlineWidth,
+    backgroundColor: 'rgba(245,158,11,0.12)',
+  },
+  crossH: {
+    position:        'absolute',
+    width:           12,
+    height:          1,
+    backgroundColor: 'rgba(245,158,11,0.35)',
+  },
+  crossV: {
+    position:        'absolute',
+    width:           1,
+    height:          12,
+    backgroundColor: 'rgba(245,158,11,0.35)',
   },
 
-  // Dot
+  // Corner bracket decorations
+  corner: {
+    position: 'absolute',
+    width:    16,
+    height:   16,
+    zIndex:   10,
+  },
+  cornerTL: { top: 8, left: 8 },
+  cornerTR: { top: 8, right: 8 },
+  cornerBL: { bottom: 8, left: 8 },
+  cornerBR: { bottom: 8, right: 8 },
+  cornerH: {
+    position:        'absolute',
+    height:          1.5,
+    width:           16,
+    backgroundColor: C_AMBER,
+    top:             0,
+    left:            0,
+  },
+  cornerV: {
+    position:        'absolute',
+    width:           1.5,
+    height:          16,
+    backgroundColor: C_AMBER,
+    top:             0,
+    left:            0,
+  },
+
+  // Location dot
   dotWrapper: {
     position:       'absolute',
     width:          DOT_RADIUS * 2,
@@ -586,102 +716,162 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   dotPulse: {
-    position:     'absolute',
-    width:        DOT_RADIUS * 2,
-    height:       DOT_RADIUS * 2,
-    borderRadius: DOT_RADIUS,
-    backgroundColor: 'rgba(59,130,246,0.35)',
+    position:        'absolute',
+    width:           DOT_RADIUS * 2,
+    height:          DOT_RADIUS * 2,
+    borderRadius:    DOT_RADIUS,
+    backgroundColor: 'rgba(245,158,11,0.35)',
   },
   dotCore: {
-    width:        14,
-    height:       14,
-    borderRadius: 7,
-    backgroundColor: '#3b82f6',
-    borderWidth:  2.5,
-    borderColor:  '#ffffff',
-    elevation:    5,
-    shadowColor:  '#1d4ed8',
-    shadowOpacity: 0.4,
-    shadowRadius:  4,
+    width:           14,
+    height:          14,
+    borderRadius:    7,
+    backgroundColor: C_AMBER,
+    borderWidth:     2,
+    borderColor:     C_WHITE,
+    elevation:       6,
+    shadowColor:     C_AMBER,
+    shadowOpacity:   0.7,
+    shadowRadius:    6,
   },
 
   // Overlays
-  loadingBadge: {
+  scanBadge: {
     position:        'absolute',
     top:             10,
     right:           10,
-    backgroundColor: 'rgba(255,255,255,0.85)',
-    borderRadius:    14,
-    padding:         6,
+    backgroundColor: C_AMBER_FNT,
+    borderRadius:    2,
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    borderWidth:     1,
+    borderColor:     C_AMBER_BRD,
+  },
+  scanBadgeText: {
+    fontFamily:    'monospace',
+    fontSize:      10,
+    fontWeight:    '700',
+    color:         C_AMBER,
+    letterSpacing: 2,
   },
   zoomHint: {
-    position:   'absolute',
-    bottom:     6,
-    alignSelf:  'center',
-    fontSize:   11,
-    color:      '#94a3b8',
+    position:      'absolute',
+    bottom:        6,
+    alignSelf:     'center',
+    fontFamily:    'monospace',
+    fontSize:      10,
+    color:         C_AMBER_DIM,
+    letterSpacing: 1.2,
   },
 
-  // Info card
+  // Info card — terminal readout
   card: {
     margin:          12,
-    marginTop:       0,
+    marginTop:       6,
     padding:         16,
-    borderRadius:    12,
-    backgroundColor: '#ffffff',
-    elevation:       3,
-    shadowColor:     '#000',
-    shadowOpacity:   0.06,
-    shadowRadius:    6,
+    borderRadius:    4,
+    backgroundColor: C_CARD_BG,
+    borderWidth:     1,
+    borderColor:     C_AMBER_BRD,
+    elevation:       10,
+    shadowColor:     C_AMBER,
+    shadowOpacity:   0.2,
+    shadowRadius:    12,
   },
-  cardTitle: {
-    fontSize:     16,
-    fontWeight:   '700',
-    color:        '#1e293b',
-    marginBottom: 10,
+  cardHeader: {
+    fontFamily:    'monospace',
+    fontSize:      13,
+    fontWeight:    '700',
+    color:         C_AMBER,
+    letterSpacing: 2,
+    textTransform: 'uppercase',
+    marginBottom:  10,
   },
-  cardRow: {
-    flexDirection:   'row',
-    justifyContent:  'space-between',
-    alignItems:      'center',
-    marginVertical:  3,
+  cardDivider: {
+    height:          1,
+    backgroundColor: C_AMBER_BRD,
+    marginBottom:    10,
   },
-  label: {
-    fontSize: 13,
-    color:    '#64748b',
+  termRow: {
+    flexDirection:     'row',
+    justifyContent:    'space-between',
+    alignItems:        'center',
+    paddingVertical:   5,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(245,158,11,0.08)',
   },
-  value: {
-    fontSize:   13,
-    fontWeight: '600',
-    color:      '#1e293b',
+  termLabel: {
+    fontFamily:    'monospace',
+    fontSize:      11,
+    color:         C_DIM_TEXT,
+    textTransform: 'uppercase',
+    letterSpacing: 1.5,
   },
-  lowConfBadge: {
-    marginTop:  10,
-    fontSize:   12,
-    fontWeight: '600',
-    color:      '#f59e0b',
+  termValue: {
+    fontFamily:    'monospace',
+    fontSize:      13,
+    fontWeight:    '700',
+    color:         C_WHITE,
+    letterSpacing: 0.5,
+  },
+  warnText: {
+    fontFamily:    'monospace',
+    fontSize:      11,
+    color:         C_WARN,
+    marginTop:     10,
+    letterSpacing: 1,
   },
 
-  // Test toggle button (floating)
+  // Confidence bar
+  confBar: {
+    flexDirection: 'row',
+    alignItems:    'center',
+    gap:           3,
+  },
+  confSeg: {
+    width:       10,
+    height:      12,
+    borderWidth: 1,
+    borderColor: C_AMBER_BRD,
+    borderRadius: 1,
+  },
+  confSegFill: {
+    backgroundColor: C_AMBER,
+    borderColor:     C_AMBER,
+  },
+  confPct: {
+    fontFamily:    'monospace',
+    fontSize:      11,
+    color:         C_AMBER,
+    marginLeft:    6,
+    fontWeight:    '700',
+  },
+
+  // Test toggle
   testToggle: {
-    position:        'absolute',
-    bottom:          140,
-    right:           16,
-    backgroundColor: '#e2e8f0',
-    borderRadius:    20,
-    paddingVertical: 8,
+    position:          'absolute',
+    bottom:            148,
+    right:             16,
+    backgroundColor:   C_AMBER_FNT,
+    borderRadius:      2,
+    paddingVertical:   9,
     paddingHorizontal: 14,
-    elevation:       4,
-    shadowColor:     '#000',
-    shadowOpacity:   0.12,
-    shadowRadius:    4,
+    borderWidth:       1,
+    borderColor:       C_AMBER_BRD,
+    elevation:         6,
+    shadowColor:       C_AMBER,
+    shadowOpacity:     0.2,
+    shadowRadius:      6,
   },
   testToggleActive: {
-    backgroundColor: '#fef08a',
+    backgroundColor: 'rgba(245,158,11,0.22)',
+    borderColor:     C_AMBER,
   },
   testToggleText: {
-    fontSize:   12,
-    fontWeight: '700',
-    color:      '#1e293b',
+    fontFamily:    'monospace',
+    fontSize:      11,
+    fontWeight:    '700',
+    color:         C_AMBER,
+    letterSpacing: 1.5,
   },
 });
